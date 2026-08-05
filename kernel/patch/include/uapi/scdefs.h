@@ -99,6 +99,8 @@ struct kernel_storage
 #define SUPERCALL_KSTORAGE_REMOVE 0x1044
 #define SUPERCALL_KSTORAGE_REMOVE_GROUP 0x1045
 
+#define SUPERCALL_CONTROL_FEATURE 0x1046
+
 #define KSTORAGE_SU_LIST_GROUP 0
 #define KSTORAGE_EXCLUDE_LIST_GROUP 1
 #define KSTORAGE_SU_AUDIT_GROUP 2
@@ -118,9 +120,7 @@ struct su_profile
     char scontext[SUPERCALL_SCONTEXT_LEN];
 };
 
-#ifndef TASK_COMM_LEN
-#define TASK_COMM_LEN 16
-#endif
+#define SU_AUDIT_COMM_LEN 16
 
 struct su_audit_entry
 {
@@ -130,7 +130,7 @@ struct su_audit_entry
     pid_t tgid;
     uid_t to_uid;
     char scontext[SUPERCALL_SCONTEXT_LEN];
-    char comm[TASK_COMM_LEN];
+    char comm[SU_AUDIT_COMM_LEN];
 };
 
 #ifdef ANDROID
