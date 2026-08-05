@@ -217,37 +217,6 @@ const char *su_get_path()
 }
 KP_EXPORT_SYMBOL(su_get_path);
 
-// Write a NUL-terminated string into a fresh slot just below the current user
-// stack and hand back the user pointer. The trailing NUL is forced explicitly
-// and the written string is verified by reading it back, so a short/partial
-// copy can never leave an unterminated path that would break the later exec.
-static char *__user su_write_path_user_stack(const char *s, uintptr_t *spp)
-{
-    size_t slen = strnlen(s, SU_PATH_MAX_LEN);
-    if (slen == SU_PATH_MAX_LEN) return 0;
-
-    size_t len = slen + 1;
-    uintptr_t sp = *spp;
-    if (sp < len) return 0;
-
-    sp -= len;
-    sp &= 0xFFFFFFFFFFFFFFF8;
-
-    /* The compatibility helper has backend-dependent return semantics. Verify
-     * the resulting bytes instead of interpreting its return value here. */
-    compat_copy_to_user((void __user *)sp, s, len);
-
-    char nul = '\0';
-    compat_copy_to_user((void __user *)(sp + len - 1), &nul, 1);
-
-    char verify[SU_PATH_MAX_LEN] = { 0 };
-    long rlen = compat_strncpy_from_user(verify, (const char __user *)sp, sizeof(verify));
-    if (rlen <= 0 || memcmp(verify, s, len)) return 0;
-
-    *spp = sp;
-    return (char *__user)sp;
-}
-
 static void handle_before_execve(char **__user u_filename_p, char **__user uargv, void *udata)
 {
     uid_t uid = current_uid();
@@ -291,64 +260,54 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
 
         uid_t to_uid = profile.to_uid;
         const char *sctx = profile.scontext;
-        int su_rc = commit_su(to_uid, sctx);
-        if (!su_rc) {
+        if (!commit_su(to_uid, sctx)) {
             folkpatch_suaudit_record(uid,
                                      __task_pid_nr_ns(current, PIDTYPE_PID, 0),
                                      __task_pid_nr_ns(current, PIDTYPE_TGID, 0),
                                      to_uid, sctx, get_task_comm(current));
-        } else {
-            logkfi("call su cred error, uid: %d, to_uid: %d, sctx: %s, rc: %d\n", uid, to_uid, sctx, su_rc);
-            return;
         }
 
 #ifdef ANDROID
         struct file *filp = filp_open(apd_path, O_RDONLY, 0);
         if (!filp || IS_ERR(filp)) {
 #endif
-            uintptr_t sp = current_user_stack_pointer();
-            char *__user sh_u = su_write_path_user_stack(sh_path, &sp);
-            if (sh_u) {
-                *u_filename_p = sh_u;
+            void *uptr = copy_to_user_stack(sh_path, sizeof(sh_path));
+            if (uptr && !IS_ERR(uptr)) {
+                *u_filename_p = (char *__user)uptr;
             }
-            logkfi("call su uid: %d, to_uid: %d, sctx: %s, uptr: %llx\n", uid, to_uid, sctx,
-                   (unsigned long long)sh_u);
+            logkfi("call su uid: %d, to_uid: %d, sctx: %s, uptr: %llx\n", uid, to_uid, sctx, uptr);
 #ifdef ANDROID
         } else {
             filp_close(filp, 0);
 
-            // command: hand off to apd so it can set up the real root shell
-            uintptr_t sp = current_user_stack_pointer();
-            char *__user apd_u = su_write_path_user_stack(apd_path, &sp);
-            int apd_ok = 0;
-            if (apd_u) {
-                *u_filename_p = apd_u;
-                apd_ok = 1;
-            } else {
-                // fall back to a direct shell; creds are already committed
-                char *__user sh_u = su_write_path_user_stack(sh_path, &sp);
-                if (sh_u) {
-                    *u_filename_p = sh_u;
-                }
-                logkfi("call su fallback sh uid: %d, to_uid: %d, sctx: %s, uptr: %llx\n",
-                       uid, to_uid, sctx, (unsigned long long)sh_u);
+            // command
+            uint64_t sp = 0;
+            sp = current_user_stack_pointer();
+            sp -= sizeof(apd_path);
+            sp &= 0xFFFFFFFFFFFFFFF8;
+            int cplen = compat_copy_to_user((void *)sp, apd_path, sizeof(apd_path));
+            if (cplen > 0) {
+                *u_filename_p = (char *)sp;
             }
 
-            // argv: force argv[0] to the legacy su path for non-legacy su paths
+            // argv
             int argv_cplen = 0;
-            if (apd_ok && strcmp(legacy_su_path, filename)) {
-                char *__user legacy_u = su_write_path_user_stack(legacy_su_path, &sp);
-                if (legacy_u) {
-                    argv_cplen = 1;
-                    int rc = set_user_arg_ptr(0, *uargv, 0, (uintptr_t)legacy_u);
-                    if (rc < 0) { // todo: modify entire argv
-                        logkfi("call apd argv error, uid: %d, to_uid: %d, sctx: %s, rc: %d\n",
-                               uid, to_uid, sctx, rc);
+            if (strcmp(legacy_su_path, filename)) {
+                if (argv_cplen <= 0) {
+                    sp = sp ?: current_user_stack_pointer();
+                    sp -= sizeof(legacy_su_path);
+                    sp &= 0xFFFFFFFFFFFFFFF8;
+                    argv_cplen = compat_copy_to_user((void *)sp, legacy_su_path, sizeof(legacy_su_path));
+                    if (argv_cplen > 0) {
+                        int rc = set_user_arg_ptr(0, *uargv, 0, sp);
+                        if (rc < 0) { // todo: modify entire argv
+                            logkfi("call apd argv error, uid: %d, to_uid: %d, sctx: %s, rc: %d\n", uid, to_uid, sctx,
+                                   rc);
+                        }
                     }
                 }
             }
-            logkfi("call apd uid: %d, to_uid: %d, sctx: %s, apd: %d, argv: %d\n",
-                   uid, to_uid, sctx, apd_ok, argv_cplen);
+            logkfi("call apd uid: %d, to_uid: %d, sctx: %s, cplen: %d, %d\n", uid, to_uid, sctx, cplen, argv_cplen);
         }
 #endif // ANDROID
     }
