@@ -49,6 +49,20 @@
 #define KP_LKM_PTE_GP  PTE_GP
 #endif
 
+/* Contiguous (PTE_CONT, bit52) 4K-grouping: 16 consecutive pages share one
+ * permission set and must be changed together, otherwise the group is left in
+ * an arch-invalid state and the next access faults. */
+#ifndef PTE_CONT
+#define KP_LKM_PTE_CONT (1UL << 52)
+#else
+#define KP_LKM_PTE_CONT PTE_CONT
+#endif
+#ifndef CONT_PTES
+#define KP_LKM_CONT_PTES 16
+#else
+#define KP_LKM_CONT_PTES CONT_PTES
+#endif
+
 /* Runtime-resolved kernel symbols (not exported on GKI 5.15). */
 static void *(*kp_module_alloc)(unsigned long size);
 static void (*kp_module_memfree)(void *module_region);
@@ -72,21 +86,30 @@ static struct mm_struct *kp_kpm_init_mm;
  * compiled without bti c landing pads, but GKI kernels set PTE_GP on module_alloc
  * pages, and module_alloc may return PXN pages (NX) that set_memory_x() fails to
  * flip on some builds.  Clearing PXN/UXN makes the image executable and clearing
- * GP disables BTI so every indirect call (BLR) from KPM code works. */
-static void kp_clear_bti_gp(unsigned long base, unsigned long size)
+ * GP disables BTI so every indirect call (BLR) from KPM code works.
+ *
+ * PTE updates hold init_mm.page_table_lock. Contiguous (PTE_CONT, 16x4K) groups
+ * are cleared as one unit; changing one page of a cont group leaves the group in
+ * an arch-invalid state (all members must share permissions) and the next access
+ * to the group faults — the root cause of the 6.6 KPM-load reboot.
+ *
+ * Not static: the hook engine reuses it to make trampoline pages executable when
+ * set_memory_x is unreliable/absent on GKI 6.6 (see kp_hook_exec_alloc). */
+void kp_clear_bti_gp(struct mm_struct *mm, unsigned long base, unsigned long size)
 {
 	unsigned long addr, end;
 
-	if (!kp_kpm_init_mm)
+	if (!mm)
 		return;
 
 	end = base + size;
 	for (addr = base; addr < end; addr += PAGE_SIZE) {
-		pgd_t *pgd = pgd_offset(kp_kpm_init_mm, addr);
+		pgd_t *pgd = pgd_offset(mm, addr);
 		p4d_t *p4d;
 		pud_t *pud;
 		pmd_t *pmd;
 		pte_t *pte;
+		unsigned long group_start, group_end;
 
 		if (pgd_none(*pgd) || pgd_bad(*pgd))
 			continue;
@@ -107,12 +130,34 @@ static void kp_clear_bti_gp(unsigned long base, unsigned long size)
 		if (!pte || !pte_present(*pte))
 			continue;
 
-		pteval_t v = pte_val(*pte);
-		if (v & (KP_LKM_PTE_PXN | KP_LKM_PTE_UXN | KP_LKM_PTE_GP)) {
-			v &= ~(KP_LKM_PTE_PXN | KP_LKM_PTE_UXN | KP_LKM_PTE_GP);
-			set_pte(pte, __pte(v));
-			flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
+		spin_lock(&mm->page_table_lock);
+
+		if (pte_val(*pte) & KP_LKM_PTE_CONT) {
+			/* Whole 64K (16x4K) cont group shares one permission set. */
+			group_start = addr & ~(KP_LKM_CONT_PTES * PAGE_SIZE - 1);
+			group_end = group_start + KP_LKM_CONT_PTES * PAGE_SIZE;
+			pte_t *g = pte - ((addr - group_start) / PAGE_SIZE);
+			for (unsigned long a = group_start; a < group_end; a += PAGE_SIZE, g++) {
+				pteval_t v = pte_val(*g);
+				if (v & (KP_LKM_PTE_PXN | KP_LKM_PTE_UXN | KP_LKM_PTE_GP | KP_LKM_PTE_CONT)) {
+					v &= ~(KP_LKM_PTE_PXN | KP_LKM_PTE_UXN | KP_LKM_PTE_GP | KP_LKM_PTE_CONT);
+					set_pte(g, __pte(v));
+				}
+			}
+		} else {
+			group_start = addr;
+			group_end = addr + PAGE_SIZE;
+			pteval_t v = pte_val(*pte);
+			if (v & (KP_LKM_PTE_PXN | KP_LKM_PTE_UXN | KP_LKM_PTE_GP)) {
+				v &= ~(KP_LKM_PTE_PXN | KP_LKM_PTE_UXN | KP_LKM_PTE_GP);
+				set_pte(pte, __pte(v));
+			}
 		}
+
+		spin_unlock(&mm->page_table_lock);
+
+		flush_tlb_kernel_range(group_start, group_end);
+		addr = group_end - PAGE_SIZE; /* loop's addr += PAGE_SIZE lands on group_end */
 	}
 }
 
@@ -807,7 +852,7 @@ long kp_load_module(const void *data, int len, const char *args, const char *eve
 	/* Disable BTI on the KPM pages: the module is bare-metal compiled
 		 * without bti c landing pads, and every BLR from KPM code to the
 		 * LKM / kernel faults on GKI BTI-enabled kernels. */
-		kp_clear_bti_gp((unsigned long)mod->start, mod->size);
+		kp_clear_bti_gp(kp_kpm_init_mm, (unsigned long)mod->start, mod->size);
 	kp_flush_kpm_icache(mod->start, mod->size);
 	logkfe("KPM [%s] icache flushed\n", info->info.name);
 
@@ -1135,7 +1180,7 @@ int kp_kpm_init(void)
 				      kp_callback_tramp, xret);
 		}
 		/* module_alloc may return PXN/NX; clear PXN/UXN/GP like KPM images */
-		kp_clear_bti_gp((unsigned long)kp_callback_tramp, PAGE_SIZE);
+		kp_clear_bti_gp(kp_kpm_init_mm, (unsigned long)kp_callback_tramp, PAGE_SIZE);
 		memset(kp_callback_tramp, 0, PAGE_SIZE);
 	} else {
 		logkw("callback trampoline alloc failed; KPM kallsyms iteration unshielded\n");
