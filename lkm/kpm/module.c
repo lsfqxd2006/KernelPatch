@@ -30,7 +30,6 @@
 #include <linux/vmalloc.h>
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
-#include <stdarg.h>
 
 #include "../include/kp_lkm.h"
 
@@ -284,33 +283,6 @@ static void set_kpm_load_result(void __user *reserved, long code, const char *me
 		snprintf(result.message, sizeof(result.message), "%s", message);
 	if (copy_to_user(reserved, &result, sizeof(result)))
 		logkd("kpm load result: copy_to_user failed\n");
-}
-
-/* Diagnostic stage log. KPM loads hard-reboot GKI 6.6 jailbreak and the
- * vendor kernel has no ramoops/pstore, so dmesg is lost on reboot. Write
- * each load stage to /data/local/tmp/kpm_debug.log (fsynced so it survives
- * the reboot); the file stops at the stage that crashed. */
-static void kp_log_file(const char *fmt, ...)
-{
-	static const char path[] = "/data/local/tmp/kpm_debug.log";
-	struct file *fp;
-	char buf[256];
-	va_list args;
-	loff_t pos;
-	ssize_t len;
-
-	fp = filp_open(path, O_WRONLY | O_CREAT, 0666);
-	if (IS_ERR(fp))
-		return;
-	pos = vfs_llseek(fp, 0, SEEK_END);
-
-	va_start(args, fmt);
-	len = vsnprintf(buf, sizeof(buf), fmt, args);
-	va_end(args);
-	if (len > 0)
-		kernel_write(fp, buf, min_t(ssize_t, len, sizeof(buf) - 1), &pos);
-	vfs_fsync(fp, 1);
-	filp_close(fp, NULL);
 }
 
 static char *next_string(char *string, unsigned long *secsize)
@@ -813,23 +785,16 @@ long kp_load_module(const void *data, int len, const char *args, const char *eve
 	struct kp_load_info *info = &load_info;
 	long rc = 0;
 
-	kp_log_file("kpm-load: start len=%d args='%s'\n", len, args ? args : "(null)");
-
 	if (!kp_module_alloc && !kp_execmem_alloc) {
 		set_load_error(info, "executable memory allocator unavailable");
 		rc = -ENOSYS;
 		goto out;
 	}
 
-	if ((rc = elf_header_check(info))) {
-		kp_log_file("kpm-load: FAIL elf_header_check rc=%ld\n", rc);
+	if ((rc = elf_header_check(info)))
 		goto out;
-	}
-	if ((rc = setup_load_info(info))) {
-		kp_log_file("kpm-load: FAIL setup_load_info rc=%ld\n", rc);
+	if ((rc = setup_load_info(info)))
 		goto out;
-	}
-	kp_log_file("kpm-load: elf+info OK name='%s'\n", info->info.name);
 
 	if (kp_find_module(info->info.name)) {
 		logkfd("%s exist\n", info->info.name);
@@ -857,28 +822,20 @@ long kp_load_module(const void *data, int len, const char *args, const char *eve
 	layout_sections(mod, info);
 	layout_symtab(mod, info);
 	logkfe("KPM [%s] layout done size=0x%x\n", info->info.name, mod->size);
-	kp_log_file("kpm-load: layout done size=0x%x\n", mod->size);
 
 	if ((rc = move_module(mod, info))) {
 		set_load_error(info, "allocate executable module memory failed");
-		kp_log_file("kpm-load: FAIL move_module rc=%ld\n", rc);
 		goto free;
 	}
 	logkfe("KPM [%s] moved to %px init=%px\n", info->info.name, mod->start, mod->init);
-	kp_log_file("kpm-load: moved start=%px init=%px\n", mod->start, mod->init);
-	if ((rc = simplify_symbols(mod, info))) {
-		kp_log_file("kpm-load: FAIL simplify_symbols rc=%ld\n", rc);
+	if ((rc = simplify_symbols(mod, info)))
 		goto free;
-	}
 	logkfe("KPM [%s] symbols resolved\n", info->info.name);
-	kp_log_file("kpm-load: symbols resolved\n");
 	if ((rc = apply_relocations(mod, info))) {
 		set_load_error(info, "apply relocations failed");
-		kp_log_file("kpm-load: FAIL apply_relocations rc=%ld\n", rc);
 		goto free;
 	}
 	logkfe("KPM [%s] relocations applied\n", info->info.name);
-	kp_log_file("kpm-load: relocations applied\n");
 
 	/* GKI 5.10+ module_alloc returns PAGE_KERNEL (PXN set, non-executable).
 	 * The kernel's own module loader calls set_memory_x() after writing; we
@@ -890,19 +847,14 @@ long kp_load_module(const void *data, int len, const char *args, const char *eve
 		if (xret)
 			logke("KPM [%s] set_memory_x(%px, %d) = %d\n",
 			      info->info.name, mod->start, npages, xret);
-		kp_log_file("kpm-load: set_memory_x ret=%d\n", xret);
-	} else {
-		kp_log_file("kpm-load: set_memory_x NULL, skipped\n");
 	}
 
 	/* Disable BTI on the KPM pages: the module is bare-metal compiled
 		 * without bti c landing pads, and every BLR from KPM code to the
 		 * LKM / kernel faults on GKI BTI-enabled kernels. */
 		kp_clear_bti_gp(kp_kpm_init_mm, (unsigned long)mod->start, mod->size);
-	kp_log_file("kpm-load: clear_bti_gp done\n");
 	kp_flush_kpm_icache(mod->start, mod->size);
 	logkfe("KPM [%s] icache flushed\n", info->info.name);
-	kp_log_file("kpm-load: icache flushed, calling init fn=%px\n", mod->init);
 
 	pr_emerg(KPLKM_TAG ": KPM [%s] entering init=%px image=%px size=%u\n",
 		 mod->info.name, mod->init, mod->start, mod->size);
@@ -916,7 +868,6 @@ long kp_load_module(const void *data, int len, const char *args, const char *eve
 	rc = kp_call_init(mod->init, mod->args, event, reserved);
 	WRITE_ONCE(kp_loading_mod, NULL);
 	pr_emerg(KPLKM_TAG ": KPM [%s] init returned %ld\n", mod->info.name, rc);
-	kp_log_file("kpm-load: init returned rc=%ld\n", rc);
 
 	if (!rc) {
 		logkfi("[%s] succeed with [%s]\n", mod->info.name, args ? args : "");

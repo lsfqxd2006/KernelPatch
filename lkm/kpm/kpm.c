@@ -23,6 +23,14 @@
 
 long kp_kpm_load_sc(const char __user *upath, const char __user *uargs, void __user *reserved)
 {
+	/* KPM loading is disabled in jailbreak/LKM mode: the LKM KPM loader and
+	 * the inline-hook engine it relies on hard-reboot the device on GKI 6.6
+	 * when the KPM init runs, and there is no ramoops to debug it. Use a real
+	 * KernelPatch boot patch (kpimg) for KPM instead - its loader
+	 * (kernel/patch/module) is unaffected and stable. Re-enable once the LKM
+	 * loader / hook-engine issue is fixed upstream. */
+	return -ENOSYS;
+
 	char path[KPM_LOAD_PATH_LEN];
 	char *args;
 	long pathlen = strncpy_from_user(path, upath, sizeof(path));
