@@ -116,9 +116,15 @@ int __init kernelpatch_init(void)
 	 * not installed yet; the supercall handler re-checks per call. */
 	kp_manager_init();
 
-	/* Re-derive the manager uid when the package manager swaps in a fresh
-	 * packages.list (e.g. after the manager app is updated/reinstalled). */
-	hook_rename_lsm();
+	/* NOTE: hook_rename_lsm() is intentionally not installed. Its after-hook
+	 * fires on EVERY successful file/dir rename and runs dentry_path_raw()
+	 * (full dentry-chain walk) plus, on a packages.list.tmp match, a
+	 * kp_manager_scan() (iterate_dir + filp_open) — all from inside the VFS
+	 * rename path while its locks are held. Observed hard hang/reboot on 6.6
+	 * jailbreak insmod the moment any rename happens. The manager uid is
+	 * still derived by kp_manager_init() at load and re-checked by the
+	 * supercall handler per call, so only auto re-derive on manager update
+	 * is lost. */
 
 	logki("KernelPatch LKM ready\n");
 	return 0;
