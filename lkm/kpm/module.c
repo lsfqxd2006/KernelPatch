@@ -97,7 +97,7 @@ static void kp_clear_bti_gp(unsigned long base, unsigned long size)
 		if (pud_none(*pud) || pud_bad(*pud))
 			continue;
 		if (pud_sect(*pud))
-			continue; /* huge page, skip ¡ª KPM pages are 4K */
+			continue; /* huge page, skip — KPM pages are 4K */
 		pmd = pmd_offset(pud, addr);
 		if (pmd_none(*pmd) || pmd_bad(*pmd))
 			continue;

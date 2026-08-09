@@ -253,7 +253,7 @@ int kp_manager_init(void)
 
 #define KP_PACKAGES_LIST_TMP_SUFFIX "/system/packages.list.tmp"
 
-/* Must match dentry_path_raw() exactly (note the const) ¡ª kCFI type-hashes the
+/* Must match dentry_path_raw() exactly (note the const) — kCFI type-hashes the
  * indirect call, and a non-const first arg panics __cfi_slowpath_diag. */
 typedef char *(*kp_dentry_path_raw_t)(const struct dentry *dentry, char *buf, int buflen);
 static kp_dentry_path_raw_t kp_dentry_path_raw;
