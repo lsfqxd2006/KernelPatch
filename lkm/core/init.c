@@ -84,7 +84,10 @@ int __init kernelpatch_init(void)
 
 	rc = kp_hook_runtime_init();
 	if (rc)
-		logkw("KPM hook runtime unavailable: %d\n", rc);
+		/* No executable-memory path for hook trampolines (set_memory_x and
+		 * execmem_alloc both missing). Continuing would call a NULL allocator
+		 * and crash the kernel; fail the load cleanly instead. */
+		return rc;
 
 	rc = kp_kpm_init();
 	if (rc)
@@ -102,6 +105,14 @@ int __init kernelpatch_init(void)
 	 * allows reading /data. The appid may still be invalid if the manager is
 	 * not installed yet; the supercall handler re-checks per call. */
 	kp_manager_init();
+
+	/* DISABLED for bisection: inline LSM rename hook is suspected of crashing
+	 * jailbreak-mode insmod on 6.6 (CFI), together with the getname_flags hook. */
+#if 0
+	/* Re-derive the manager uid when the package manager swaps in a fresh
+	 * packages.list (e.g. after the manager app is updated/reinstalled). */
+	hook_rename_lsm();
+#endif
 
 	logki("KernelPatch LKM ready\n");
 	return 0;

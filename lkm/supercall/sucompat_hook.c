@@ -238,6 +238,16 @@ int kp_sucompat_hook_init(void)
 	if (rc)
 		return rc;
 	logki("sucompat: execve hook installed (su path %s -> %s)\n", kp_su_get_path(), KP_SH_PATH);
+
+	/* DISABLED for bisection: inline hook on the hot getname_flags path is
+	 * suspected of crashing jailbreak-mode insmod on 6.6 (CFI). */
+#if 0
+	rc = kp_hook_getname_flags();
+	if (rc)
+		logkfd("sucompat: getname_flags hook failed: %d\n", rc);
+	else
+		logki("sucompat: getname_flags hook installed\n");
+#endif
 	return 0;
 }
 
