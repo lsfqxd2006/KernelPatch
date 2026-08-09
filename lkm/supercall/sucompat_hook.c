@@ -305,11 +305,12 @@ int kp_sucompat_hook_init(void)
 		return rc;
 	logki("sucompat: execve hook installed (su path %s -> %s)\n", kp_su_get_path(), KP_SH_PATH);
 
-	rc = kp_hook_getname_flags();
-	if (rc)
-		logkfd("sucompat: getname_flags hook failed: %d\n", rc);
-	else
-		logki("sucompat: getname_flags hook installed\n");
+	/* NOTE: kp_hook_getname_flags() is intentionally not installed. The inline
+	 * hook fires on EVERY file open/stat/exec (getname_flags is the hottest
+	 * path in the kernel) and the trampoline hard-hangs/reboots the device on
+	 * 6.6 jailbreak insmod as soon as any file is accessed. Bisection shows
+	 * both this and the rename LSM hook must stay disabled; kp_bypass_kcfi is
+	 * fine. The execve hook above still handles su grants. */
 	return 0;
 }
 
