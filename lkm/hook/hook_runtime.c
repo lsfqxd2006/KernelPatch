@@ -13,6 +13,7 @@
 #include <hook.h>
 #include "../infra/patch_memory.h"
 #include "../infra/symbol_resolver.h"
+#include "../kpm/module.h"
 
 struct kp_hook_mem {
 	struct list_head list;
@@ -45,6 +46,8 @@ static void *(*kp_hook_module_alloc)(unsigned long size);
 static void (*kp_hook_module_memfree)(void *region);
 static void (*kp_hook_flush_icache_all)(void);
 static int (*kp_hook_set_memory_x)(unsigned long addr, int numpages);
+/* init_mm for kp_clear_bti_gp() (resolved at init, not exported on GKI). */
+static struct mm_struct *kp_hook_init_mm;
 
 /* noinline: these are raw resolved function pointers; if inlined into a
  * CFI-instrumented caller, the compiler emits a kCFI type-hash load of
@@ -63,9 +66,14 @@ static void *kp_hook_exec_alloc(unsigned long size)
 	else
 		p = vmalloc(size);
 	/* GKI module_alloc returns PAGE_KERNEL (PXN set, NX); vmalloc too. Hook
-	 * trampolines live here and must be executable. */
+	 * trampolines live here and must be executable. set_memory_x is the
+	 * normal path, but it is unreliable on some GKI 6.6 builds (PTE_CONT /
+	 * huge-vmap interactions); kp_clear_bti_gp() clears PXN/UXN/GP through
+	 * the raw PTE walk (handling CONT groups) as a belt-and-braces step. */
 	if (p && kp_hook_set_memory_x)
 		kp_hook_set_memory_x((unsigned long)p, pages);
+	if (p && kp_hook_init_mm)
+		kp_clear_bti_gp(kp_hook_init_mm, (unsigned long)p, size);
 	return p;
 }
 
@@ -95,6 +103,7 @@ int kp_hook_runtime_init(void)
 	kp_hook_execmem_free = (void *)kp_resolve_symbol("execmem_free");
 	kp_hook_flush_icache_all = (void *)kp_resolve_symbol("flush_icache_all");
 	kp_hook_set_memory_x = (int (*)(unsigned long, int))kp_resolve_symbol("set_memory_x");
+	kp_hook_init_mm = (struct mm_struct *)kp_resolve_symbol("init_mm");
 	if (!kp_hook_module_alloc)
 		logkw("module_alloc not found; using execmem_alloc/vmalloc for hook memory\n");
 	if (!kp_hook_set_memory_x && !kp_hook_execmem_alloc) {

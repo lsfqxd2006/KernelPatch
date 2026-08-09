@@ -98,6 +98,7 @@ int kp_kpm_init(void);
  * callback without tripping either mitigation.
  */
 struct module;
+struct mm_struct;
 /* kallsyms_on_each_symbol() dropped the struct module * parameter from its
  * callback in 6.4 (3-arg since). Match the running kernel so the resolved
  * function pointer passes the kCFI type-hash check. */
@@ -108,5 +109,9 @@ typedef int (*kp_kallsyms_cb_t)(void *, const char *, struct module *, unsigned 
 #endif
 bool kp_kpm_cfi_allowed_addr(unsigned long addr);
 int kp_kpm_safe_kallsyms_on_each_symbol(kp_kallsyms_cb_t fn, void *data);
+
+/* Make a module_alloc range executable and BTI-free (clear PXN/UXN/GP,
+ * handling PTE_CONT groups). Shared with the hook engine for trampolines. */
+void kp_clear_bti_gp(struct mm_struct *mm, unsigned long base, unsigned long size);
 
 #endif /* _KP_LKM_KPM_MODULE_H_ */
