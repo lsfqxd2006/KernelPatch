@@ -20,6 +20,7 @@
 #include "../supercall/sucompat_hook.h"
 #include "../supercall/supercall.h"
 #include "../kpm/module.h"
+#include "../infra/secpass.h"
 
 /*
  * Some A12-5.10 third-party kernels advertise CC_HAVE_STACKPROTECTOR_SYSREG but
@@ -82,12 +83,21 @@ int __init kernelpatch_init(void)
 	if (rc)
 		return rc;
 
+	/* Auto-apply APatch config (su path + package allowlist) from
+	 * /data/adb/ap. Only used on jailbroken devices where those files exist
+	 * at insmod time; the supercall path remains the manager's fallback. */
+	kp_su_load_config();
+
 	rc = kp_hook_runtime_init();
 	if (rc)
 		/* No executable-memory path for hook trampolines (set_memory_x and
 		 * execmem_alloc both missing). Continuing would call a NULL allocator
 		 * and crash the kernel; fail the load cleanly instead. */
 		return rc;
+
+	rc = kp_bypass_kcfi();
+	if (rc)
+		logkw("CFI bypass failed: %d\n", rc);
 
 	rc = kp_kpm_init();
 	if (rc)
@@ -117,7 +127,11 @@ int __init kernelpatch_init(void)
 static void __exit kernelpatch_exit(void)
 {
 	kp_sucompat_hook_exit();
+	hook_rename_lsm_exit();
 	kp_supercall_uninstall();
+	/* Unhook the CFI bypass last so it shields the other teardown from
+	 * spurious CFI failures on LKM/KPM text. */
+	kp_bypass_kcfi_exit();
 	logki("KernelPatch LKM unloaded\n");
 }
 

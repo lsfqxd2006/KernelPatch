@@ -44,6 +44,7 @@ static void (*kp_hook_execmem_free)(void *ptr);
 static void *(*kp_hook_module_alloc)(unsigned long size);
 static void (*kp_hook_module_memfree)(void *region);
 static void (*kp_hook_flush_icache_all)(void);
+static int (*kp_hook_set_memory_x)(unsigned long addr, int numpages);
 
 /* noinline: these are raw resolved function pointers; if inlined into a
  * CFI-instrumented caller, the compiler emits a kCFI type-hash load of

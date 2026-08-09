@@ -3,8 +3,11 @@
 #include "symbols.h"
 
 #include <linux/cred.h>
+#include <linux/gfp.h>
+#include <linux/kallsyms.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <linux/string.h>
@@ -20,6 +23,10 @@
 #include "../include/kp_lkm.h"
 #include "../infra/symbol_resolver.h"
 #include "../infra/patch_memory.h"
+#include "../infra/syscall_table.h"
+#include "../supercall/sucompat.h"
+#include "../supercall/kstorage.h"
+#include "module.h"
 
 #include <asm/thread_info.h>
 #include <hook.h>
@@ -31,6 +38,11 @@ static int kp_kpm_thread_info_in_task = 1;
 static int kp_kpm_sp_el0_is_current = 1;
 static int kp_kpm_sp_el0_is_thread_info;
 static int kp_kpm_task_in_thread_info_offset = -1;
+/* KP ABI stack-layout facts (arm64 GKI: task->stack + THREAD_SIZE is the end
+ * of stack, pt_regs sits just below it). */
+static int kp_kpm_stack_in_task_offset = offsetof(struct task_struct, stack);
+static int kp_kpm_stack_end_offset = THREAD_SIZE;
+static int kp_kpm_has_syscall_wrapper;
 
 struct kp_kpm_task_struct_offset {
 	s16 pid_offset, tgid_offset, thread_pid_offset, ptracer_cred_offset;
@@ -101,17 +113,6 @@ static int kp_kpm_printk(const char *fmt, ...)
 	return rc;
 }
 
-static int kp_kpm_sprintf(char *buf, const char *fmt, ...)
-{
-	va_list args;
-	int rc;
-
-	va_start(args, fmt);
-	rc = vsprintf(buf, fmt, args);
-	va_end(args);
-	return rc;
-}
-
 static int kp_kpm_copy_to_user(void __user *to, const void *from, int len)
 {
 	return copy_to_user(to, from, len) ? 0 : len;
@@ -131,13 +132,6 @@ static long kp_kpm_strncpy_from_user(char *dst, const char __user *src, long cou
 static uid_t kp_kpm_current_uid(void)
 {
 	return from_kuid(current_user_ns(), current_uid());
-}
-
-/* KP kfuncs that KPMs may import (kpimg exports these via baselib / hotpatch).
- * kf_strncat mirrors lib_strncat; hotpatch_nosync patches one instruction. */
-static char *kp_kpm_strncat(char *dst, const char *src, size_t n)
-{
-	return strncat(dst, src, n);
 }
 
 static long kp_kpm_hotpatch_nosync(void *addr, uint32_t value)
@@ -304,9 +298,46 @@ static struct kp_kpm_symbol kp_kpm_symbols[] = {
 	{ "task_in_thread_info_offset", (unsigned long)&kp_kpm_task_in_thread_info_offset },
 	{ "task_struct_offset", (unsigned long)&kp_kpm_task_struct_offset },
 	{ "pgtable_entry", (unsigned long)kp_kpm_pgtable_entry },
-	{ "printk", (unsigned long)kp_kpm_printk },
-	{ "kf_sprintf", (unsigned long)kp_kpm_sprintf },
-	{ "kf_strncat", (unsigned long)kp_kpm_strncat },
+	{ "printk", (unsigned long)&kp_kpm_printk_fn },
+	{ "kallsyms_lookup_name", (unsigned long)&kp_kpm_kallsyms_lookup_name_fn },
+	{ "kallsyms_on_each_symbol", (unsigned long)&kp_kpm_kallsyms_on_each_symbol_fn },
+	KP_KPM_KFUNC_ENTRY(sprintf),
+	KP_KPM_KFUNC_ENTRY(snprintf),
+	KP_KPM_KFUNC_ENTRY(vsnprintf),
+	KP_KPM_KFUNC_ENTRY(strcpy),
+	KP_KPM_KFUNC_ENTRY(strncpy),
+	KP_KPM_KFUNC_ENTRY(strncat),
+	KP_KPM_KFUNC_ENTRY(strcmp),
+	KP_KPM_KFUNC_ENTRY(strncmp),
+	KP_KPM_KFUNC_ENTRY(strlen),
+	KP_KPM_KFUNC_ENTRY(strnlen),
+	KP_KPM_KFUNC_ENTRY(strchr),
+	KP_KPM_KFUNC_ENTRY(strrchr),
+	KP_KPM_KFUNC_ENTRY(strstr),
+	KP_KPM_KFUNC_ENTRY(memset),
+	KP_KPM_KFUNC_ENTRY(memcpy),
+	KP_KPM_KFUNC_ENTRY(memmove),
+	KP_KPM_KFUNC_ENTRY(memcmp),
+	KP_KPM_KFUNC_ENTRY(kstrdup),
+	KP_KPM_KFUNC_ENTRY(kmemdup),
+	KP_KPM_KFUNC_ENTRY(kasprintf),
+	KP_KPM_KFUNC_ENTRY(memchr),
+	KP_KPM_KFUNC_ENTRY(strcat),
+	{ "mm_struct_offset", (unsigned long)&kp_kpm_mm_struct_offset },
+	{ "has_config_compat", (unsigned long)&kp_kpm_has_config_compat },
+	{ "has_syscall_wrapper", (unsigned long)&kp_kpm_has_syscall_wrapper },
+	{ "stack_in_task_offset", (unsigned long)&kp_kpm_stack_in_task_offset },
+	{ "stack_end_offset", (unsigned long)&kp_kpm_stack_end_offset },
+	{ "hook_syscalln", (unsigned long)kp_kpm_hook_syscalln },
+	{ "unhook_syscalln", (unsigned long)kp_kpm_unhook_syscalln },
+	{ "hook_compat_syscalln", (unsigned long)kp_kpm_hook_compat_syscalln },
+	{ "unhook_compat_syscalln", (unsigned long)kp_kpm_unhook_compat_syscalln },
+	{ "syscalln_addr", (unsigned long)kp_kpm_syscalln_addr },
+	{ "syscalln_name_addr", (unsigned long)kp_kpm_syscalln_name_addr },
+	{ "_task_pt_reg", (unsigned long)kp_kpm_task_pt_reg },
+	{ "is_su_allow_uid", (unsigned long)kp_kpm_is_su_allow_uid },
+	{ "get_ap_mod_exclude", (unsigned long)kp_kpm_get_ap_mod_exclude },
+	{ "set_ap_mod_exclude", (unsigned long)kp_kpm_set_ap_mod_exclude },
 	{ "hotpatch_nosync", (unsigned long)kp_kpm_hotpatch_nosync },
 	{ "hook_wrap", (unsigned long)hook_wrap },
 	{ "hook_unwrap_remove", (unsigned long)hook_unwrap_remove },
@@ -321,8 +352,75 @@ static struct kp_kpm_symbol kp_kpm_symbols[] = {
 
 int kp_kpm_symbols_init(void)
 {
-	logki("kpm compatibility symbol table ready (%zu symbols)\n",
-	      ARRAY_SIZE(kp_kpm_symbols));
+	kp_kpm_printk_fn = kp_kpm_printk;
+	kp_kpm_kallsyms_lookup_name_fn = kallsyms_lookup_name;
+	/* Route KPM kallsyms iteration through the bti-c trampoline + CFI shield
+	 * so Qualcomm's find_check_fn() panic and the BTI fault on bare-metal
+	 * callbacks are avoided. */
+	kp_kpm_kallsyms_on_each_symbol_fn = kp_kpm_safe_kallsyms_on_each_symbol;
+
+	KP_KPM_KFUNC_INIT(sprintf);
+	KP_KPM_KFUNC_INIT(snprintf);
+	KP_KPM_KFUNC_INIT(vsnprintf);
+	KP_KPM_KFUNC_INIT(strcpy);
+	KP_KPM_KFUNC_INIT(strncpy);
+	KP_KPM_KFUNC_INIT(strncat);
+	KP_KPM_KFUNC_INIT(strcmp);
+	KP_KPM_KFUNC_INIT(strncmp);
+	KP_KPM_KFUNC_INIT(strlen);
+	KP_KPM_KFUNC_INIT(strnlen);
+	KP_KPM_KFUNC_INIT(strchr);
+	KP_KPM_KFUNC_INIT(strrchr);
+	KP_KPM_KFUNC_INIT(strstr);
+	KP_KPM_KFUNC_INIT(memset);
+	KP_KPM_KFUNC_INIT(memcpy);
+	KP_KPM_KFUNC_INIT(memmove);
+	KP_KPM_KFUNC_INIT(memcmp);
+	KP_KPM_KFUNC_INIT(kstrdup);
+	KP_KPM_KFUNC_INIT(kmemdup);
+	KP_KPM_KFUNC_INIT(kasprintf);
+	KP_KPM_KFUNC_INIT(memchr);
+	KP_KPM_KFUNC_INIT(strcat);
+
+	/* mm_struct offsets (5.15 arm64) */
+	kp_kpm_mm_struct_offset.mmap_base_offset = offsetof(struct mm_struct, mmap_base);
+	kp_kpm_mm_struct_offset.task_size_offset = offsetof(struct mm_struct, task_size);
+	kp_kpm_mm_struct_offset.pgd_offset = offsetof(struct mm_struct, pgd);
+	kp_kpm_mm_struct_offset.map_count_offset = offsetof(struct mm_struct, map_count);
+	kp_kpm_mm_struct_offset.total_vm_offset = offsetof(struct mm_struct, total_vm);
+	kp_kpm_mm_struct_offset.locked_vm_offset = offsetof(struct mm_struct, locked_vm);
+	kp_kpm_mm_struct_offset.pinned_vm_offset = offsetof(struct mm_struct, pinned_vm);
+	kp_kpm_mm_struct_offset.data_vm_offset = offsetof(struct mm_struct, data_vm);
+	kp_kpm_mm_struct_offset.exec_vm_offset = offsetof(struct mm_struct, exec_vm);
+	kp_kpm_mm_struct_offset.stack_vm_offset = offsetof(struct mm_struct, stack_vm);
+	kp_kpm_mm_struct_offset.start_code_offset = offsetof(struct mm_struct, start_code);
+	kp_kpm_mm_struct_offset.end_code_offset = offsetof(struct mm_struct, end_code);
+	kp_kpm_mm_struct_offset.start_data_offset = offsetof(struct mm_struct, start_data);
+	kp_kpm_mm_struct_offset.end_data_offset = offsetof(struct mm_struct, end_data);
+	kp_kpm_mm_struct_offset.start_brk_offset = offsetof(struct mm_struct, start_brk);
+	kp_kpm_mm_struct_offset.brk_offset = offsetof(struct mm_struct, brk);
+	kp_kpm_mm_struct_offset.start_stack_offset = offsetof(struct mm_struct, start_stack);
+	kp_kpm_mm_struct_offset.arg_start_offset = offsetof(struct mm_struct, arg_start);
+	kp_kpm_mm_struct_offset.arg_end_offset = offsetof(struct mm_struct, arg_end);
+	kp_kpm_mm_struct_offset.env_start_offset = offsetof(struct mm_struct, env_start);
+	kp_kpm_mm_struct_offset.env_end_offset = offsetof(struct mm_struct, env_end);
+
+	kp_kpm_has_config_compat = 0;
+
+	/* arm64 GKI: syscalls go through __arm64_sys_* wrappers, so the KPM must
+	 * parse syscall args with the wrapper ABI (narg + 1). */
+	kp_kpm_has_syscall_wrapper = 0;
+	if (kallsyms_lookup_name("__arm64_sys_openat"))
+		kp_kpm_has_syscall_wrapper = 1;
+
+	logki("kpm stack facts: stack_in_task=%d stack_end=%d has_syscall_wrapper=%d\n",
+	      kp_kpm_stack_in_task_offset, kp_kpm_stack_end_offset,
+	      kp_kpm_has_syscall_wrapper);
+
+	logki("kpm compatibility symbol table ready (%zu symbols) printk=%px "
+	      "kallsyms_lookup_name=%px kf_strncat=%px kf_strcmp=%px\n",
+	      ARRAY_SIZE(kp_kpm_symbols), kp_kpm_printk_fn, kp_kpm_kallsyms_lookup_name_fn,
+	      kf_strncat, kf_strcmp);
 	return 0;
 }
 
