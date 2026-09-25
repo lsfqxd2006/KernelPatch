@@ -30,6 +30,17 @@ struct folkpatch_netisolate_state {
 
 static struct folkpatch_netisolate_state netisolate;
 static unsigned long (*netisolate_copy_from_user)(void *, const void __user *, unsigned long);
+static int netisolate_state_initialized;
+static int netisolate_hook_init_done;
+
+static int folkpatch_netisolate_state_init(void)
+{
+    if (netisolate_state_initialized) return 0;
+    memset(&netisolate, 0, sizeof(netisolate));
+    spin_lock_init(&netisolate.lock);
+    netisolate_state_initialized = 1;
+    return 0;
+}
 
 static int folkpatch_netisolate_uid_selected(uid_t uid)
 {
@@ -93,28 +104,39 @@ int folkpatch_netisolate_init(void)
     hook_err_t connect_rc;
     hook_err_t sendto_rc;
 
-    memset(&netisolate, 0, sizeof(netisolate));
-    spin_lock_init(&netisolate.lock);
+    if (netisolate.hooks_ready) return 0;
+    if (netisolate_hook_init_done) return -ENOSYS;
+    netisolate_hook_init_done = 1;
     netisolate_copy_from_user = (void *)kallsyms_lookup_name("__arch_copy_from_user");
     if (!netisolate_copy_from_user)
         netisolate_copy_from_user = (void *)kallsyms_lookup_name("_copy_from_user");
     if (!netisolate_copy_from_user) return -ENOSYS;
 
-    connect_rc = fp_hook_syscalln(__NR_connect, 3,
-                                  folkpatch_netisolate_before_connect, 0, 0);
-    sendto_rc = fp_hook_syscalln(__NR_sendto, 6,
-                                 folkpatch_netisolate_before_sendto, 0, 0);
+    connect_rc = hook_syscalln_override(__NR_connect, 3,
+                                       folkpatch_netisolate_before_connect, 0, 0);
+    sendto_rc = hook_syscalln_override(__NR_sendto, 6,
+                                      folkpatch_netisolate_before_sendto, 0, 0);
     netisolate.hooks_ready = !connect_rc && !sendto_rc;
-    return netisolate.hooks_ready ? 0 : -ENOSYS;
+    if (!netisolate.hooks_ready) {
+        if (!connect_rc) {
+            unhook_syscalln(__NR_connect, folkpatch_netisolate_before_connect, 0);
+        }
+        if (!sendto_rc) {
+            unhook_syscalln(__NR_sendto, folkpatch_netisolate_before_sendto, 0);
+        }
+        return -ENOSYS;
+    }
+    return 0;
 }
 
 long folkpatch_netisolate_enable(int enable)
 {
-    unsigned long flags = spin_lock_irqsave(&netisolate.lock);
-    if (enable && !netisolate.hooks_ready) {
-        spin_unlock_irqrestore(&netisolate.lock, flags);
-        return -ENOSYS;
+    folkpatch_netisolate_state_init();
+    if (enable) {
+        int rc = folkpatch_netisolate_init();
+        if (rc) return rc;
     }
+    unsigned long flags = spin_lock_irqsave(&netisolate.lock);
     if (enable) netisolate.manager_uid = current_uid();
     netisolate.enabled = !!enable;
     spin_unlock_irqrestore(&netisolate.lock, flags);
@@ -125,6 +147,7 @@ long folkpatch_netisolate_status(void)
 {
     int enabled;
     int count;
+    folkpatch_netisolate_state_init();
     unsigned long flags = spin_lock_irqsave(&netisolate.lock);
     enabled = netisolate.enabled;
     count = netisolate.uid_count;
@@ -138,6 +161,7 @@ long folkpatch_netisolate_uid_add(uid_t uid)
     unsigned long flags;
 
     if (!uid) return -EINVAL;
+    folkpatch_netisolate_state_init();
     flags = spin_lock_irqsave(&netisolate.lock);
     for (i = 0; i < netisolate.uid_count; i++) {
         if (netisolate.uids[i] == uid) {
@@ -160,6 +184,7 @@ long folkpatch_netisolate_uid_remove(uid_t uid)
     unsigned long flags;
 
     if (!uid) return -EINVAL;
+    folkpatch_netisolate_state_init();
     flags = spin_lock_irqsave(&netisolate.lock);
     for (i = 0; i < netisolate.uid_count; i++) {
         if (netisolate.uids[i] == uid) {
@@ -182,6 +207,7 @@ long folkpatch_netisolate_uid_list(char __user *out, int out_len)
     unsigned long flags;
 
     if (!out || out_len <= 0) return -EINVAL;
+    folkpatch_netisolate_state_init();
     buffer = vmalloc(FOLKPATCH_NETISOLATE_MAX_UIDS * 12);
     if (!buffer) return -ENOMEM;
     flags = spin_lock_irqsave(&netisolate.lock);
@@ -208,6 +234,7 @@ long folkpatch_netisolate_uid_list(char __user *out, int out_len)
 
 long folkpatch_netisolate_uid_clear(void)
 {
+    folkpatch_netisolate_state_init();
     unsigned long flags = spin_lock_irqsave(&netisolate.lock);
     netisolate.uid_count = 0;
     spin_unlock_irqrestore(&netisolate.lock, flags);

@@ -42,6 +42,17 @@ static void *(*pathhide_fget)(unsigned int);
 static void (*pathhide_fput)(void *);
 static char *(*pathhide_file_path)(void *, char *, int);
 static unsigned long (*pathhide_copy_from_user)(void *, const void __user *, unsigned long);
+static int pathhide_state_initialized;
+static int pathhide_hook_init_done;
+
+static int folkpatch_pathhide_state_init(void)
+{
+    if (pathhide_state_initialized) return 0;
+    memset(&pathhide, 0, sizeof(pathhide));
+    spin_lock_init(&pathhide.lock);
+    pathhide_state_initialized = 1;
+    return 0;
+}
 
 static int folkpatch_pathhide_copy_path(const char __user *path, char *out)
 {
@@ -211,23 +222,31 @@ int folkpatch_pathhide_init(void)
     hook_err_t newfstatat;
     hook_err_t getdents64;
 
-    memset(&pathhide, 0, sizeof(pathhide));
-    spin_lock_init(&pathhide.lock);
+    if (pathhide.hooks_ready) return 0;
+    if (pathhide_hook_init_done) return -ENOSYS;
+    pathhide_hook_init_done = 1;
     pathhide_fget = (void *)kallsyms_lookup_name("fget");
     pathhide_fput = (void *)kallsyms_lookup_name("fput");
     pathhide_file_path = (void *)kallsyms_lookup_name("file_path");
     pathhide_copy_from_user = (void *)kallsyms_lookup_name("__arch_copy_from_user");
     if (!pathhide_copy_from_user)
         pathhide_copy_from_user = (void *)kallsyms_lookup_name("_copy_from_user");
-    openat = fp_hook_syscalln(__NR_openat, 4, folkpatch_pathhide_before_path, 0, 0);
-    faccessat = fp_hook_syscalln(__NR_faccessat, 3, folkpatch_pathhide_before_path, 0, 0);
-    newfstatat = fp_hook_syscalln(__NR3264_fstatat, 4, folkpatch_pathhide_before_path, 0, 0);
-    getdents64 = fp_hook_syscalln(__NR_getdents64, 3, 0,
-                                  folkpatch_pathhide_after_getdents64, 0);
+    openat = hook_syscalln_override(__NR_openat, 4, folkpatch_pathhide_before_path, 0, 0);
+    faccessat = hook_syscalln_override(__NR_faccessat, 3, folkpatch_pathhide_before_path, 0, 0);
+    newfstatat = hook_syscalln_override(__NR3264_fstatat, 4, folkpatch_pathhide_before_path, 0, 0);
+    getdents64 = hook_syscalln_override(__NR_getdents64, 3, 0,
+                                       folkpatch_pathhide_after_getdents64, 0);
     pathhide.hooks_ready = !openat && !faccessat && !newfstatat && !getdents64 &&
                            pathhide_fget && pathhide_fput && pathhide_file_path &&
                            pathhide_copy_from_user;
-    return pathhide.hooks_ready ? 0 : -ENOSYS;
+    if (!pathhide.hooks_ready) {
+        if (!openat) unhook_syscalln(__NR_openat, folkpatch_pathhide_before_path, 0);
+        if (!faccessat) unhook_syscalln(__NR_faccessat, folkpatch_pathhide_before_path, 0);
+        if (!newfstatat) unhook_syscalln(__NR3264_fstatat, folkpatch_pathhide_before_path, 0);
+        if (!getdents64) unhook_syscalln(__NR_getdents64, 0, folkpatch_pathhide_after_getdents64);
+        return -ENOSYS;
+    }
+    return 0;
 }
 
 long folkpatch_pathhide_add(const char __user *path)
@@ -238,6 +257,7 @@ long folkpatch_pathhide_add(const char __user *path)
     int len = folkpatch_pathhide_copy_path(path, value);
 
     if (len < 0) return len;
+    folkpatch_pathhide_state_init();
     flags = spin_lock_irqsave(&pathhide.lock);
     for (i = 0; i < pathhide.path_count; i++) {
         if (!strcmp(pathhide.paths[i], value)) {
@@ -262,6 +282,7 @@ long folkpatch_pathhide_remove(const char __user *path)
     int len = folkpatch_pathhide_copy_path(path, value);
 
     if (len < 0) return len;
+    folkpatch_pathhide_state_init();
     flags = spin_lock_irqsave(&pathhide.lock);
     for (i = 0; i < pathhide.path_count; i++) {
         if (!strcmp(pathhide.paths[i], value)) {
@@ -286,6 +307,7 @@ long folkpatch_pathhide_list(char __user *out, int out_len)
     unsigned long flags;
 
     if (!out || out_len <= 0) return -EINVAL;
+    folkpatch_pathhide_state_init();
     snapshot = vmalloc(FOLKPATCH_PATHHIDE_MAX_PATHS * FOLKPATCH_PATHHIDE_MAX_PATH_LEN);
     if (!snapshot) return -ENOMEM;
     flags = spin_lock_irqsave(&pathhide.lock);
@@ -307,6 +329,7 @@ long folkpatch_pathhide_list(char __user *out, int out_len)
 
 long folkpatch_pathhide_clear(void)
 {
+    folkpatch_pathhide_state_init();
     unsigned long flags = spin_lock_irqsave(&pathhide.lock);
     pathhide.path_count = 0;
     spin_unlock_irqrestore(&pathhide.lock, flags);
@@ -315,11 +338,12 @@ long folkpatch_pathhide_clear(void)
 
 long folkpatch_pathhide_enable(int enable)
 {
-    unsigned long flags = spin_lock_irqsave(&pathhide.lock);
-    if (enable && !pathhide.hooks_ready) {
-        spin_unlock_irqrestore(&pathhide.lock, flags);
-        return -ENOSYS;
+    folkpatch_pathhide_state_init();
+    if (enable) {
+        int rc = folkpatch_pathhide_init();
+        if (rc) return rc;
     }
+    unsigned long flags = spin_lock_irqsave(&pathhide.lock);
     if (enable) pathhide.manager_uid = current_uid();
     pathhide.enabled = !!enable;
     spin_unlock_irqrestore(&pathhide.lock, flags);
@@ -330,6 +354,7 @@ long folkpatch_pathhide_status(void)
 {
     int enabled;
     int count;
+    folkpatch_pathhide_state_init();
     unsigned long flags = spin_lock_irqsave(&pathhide.lock);
     enabled = pathhide.enabled;
     count = pathhide.path_count;
@@ -343,6 +368,7 @@ long folkpatch_pathhide_uid_add(uid_t uid)
     int i;
 
     if (!uid) return -EINVAL;
+    folkpatch_pathhide_state_init();
     flags = spin_lock_irqsave(&pathhide.lock);
     for (i = 0; i < pathhide.uid_count; i++) {
         if (pathhide.uids[i] == uid) {
@@ -365,6 +391,7 @@ long folkpatch_pathhide_uid_remove(uid_t uid)
     int i;
 
     if (!uid) return -EINVAL;
+    folkpatch_pathhide_state_init();
     flags = spin_lock_irqsave(&pathhide.lock);
     for (i = 0; i < pathhide.uid_count; i++) {
         if (pathhide.uids[i] == uid) {
@@ -387,6 +414,7 @@ long folkpatch_pathhide_uid_list(char __user *out, int out_len)
     unsigned long flags;
 
     if (!out || out_len <= 0) return -EINVAL;
+    folkpatch_pathhide_state_init();
     snapshot = vmalloc(FOLKPATCH_PATHHIDE_MAX_UIDS * 12);
     if (!snapshot) return -ENOMEM;
     flags = spin_lock_irqsave(&pathhide.lock);
@@ -408,6 +436,7 @@ long folkpatch_pathhide_uid_list(char __user *out, int out_len)
 
 long folkpatch_pathhide_uid_clear(void)
 {
+    folkpatch_pathhide_state_init();
     unsigned long flags = spin_lock_irqsave(&pathhide.lock);
     pathhide.uid_count = 0;
     spin_unlock_irqrestore(&pathhide.lock, flags);
@@ -416,6 +445,7 @@ long folkpatch_pathhide_uid_clear(void)
 
 long folkpatch_pathhide_uid_mode(int enable)
 {
+    folkpatch_pathhide_state_init();
     unsigned long flags = spin_lock_irqsave(&pathhide.lock);
     pathhide.uid_mode = !!enable;
     spin_unlock_irqrestore(&pathhide.lock, flags);
@@ -424,6 +454,7 @@ long folkpatch_pathhide_uid_mode(int enable)
 
 long folkpatch_pathhide_filter_system(int enable)
 {
+    folkpatch_pathhide_state_init();
     unsigned long flags = spin_lock_irqsave(&pathhide.lock);
     pathhide.filter_system = !!enable;
     spin_unlock_irqrestore(&pathhide.lock, flags);

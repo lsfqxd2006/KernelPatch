@@ -440,7 +440,6 @@ static void before(hook_fargs6_t *args, void *udata)
         char key[MAX_KEY_LEN];
         long len = compat_strncpy_from_user(key, key_user, MAX_KEY_LEN);
         if (len <= 0) {
-            logkfi("[diag:sc] uid=%d has_preset=%d key_copy_fail len=%ld\n", uid, has_preset, len);
             return;
         }
         is_authed = !auth_superkey(key);
@@ -460,8 +459,6 @@ static void before(hook_fargs6_t *args, void *udata)
         if (!has_preset) is_authed = 1;
     }
     if (!is_trusted_caller) {
-        logkfi("[diag:sc] uid=%d has_preset=%d is_tm=%d is_su=%d denied\n",
-               uid, has_preset, is_tm, is_su);
         return;
     }
 
@@ -486,7 +483,11 @@ int supercall_install()
 {
     int rc = 0;
 
-    hook_err_t err = hook_syscalln(__NR_supercall, 6, before, 0, 0);
+    /* The magic supercall short-circuits the real syscall. hook_syscalln_override
+     * routes it through the global dispatcher when that is hooked at
+     * invoke_syscall, so syscall 45 uses the same single trampoline as every
+     * other syscall; it falls back to the per-syscall hook otherwise. */
+    hook_err_t err = hook_syscalln_override(__NR_supercall, 6, before, 0, 0);
     if (err) {
         log_boot("install supercall hook error: %d\n", err);
         rc = err;
