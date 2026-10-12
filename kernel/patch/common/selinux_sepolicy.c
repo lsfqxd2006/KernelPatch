@@ -45,11 +45,9 @@
 #include <uapi/asm-generic/errno.h>
 #include <security/selinux/include/security.h>
 #include <security/selinux/include/avc.h>
+#include <selinux_hide.h>
 
 /* ---- constants ---- */
-
-#define KP_SEPOLICY_MIN_VERSION VERSION(4, 19, 0)
-#define KP_SEPOLICY_WITH_POLICY_MIN_VERSION VERSION(6, 4, 0) /* helpers drop the state arg here */
 
 #define KP_POLICY_POLICYDB_OFFSET (sizeof(void *)) /* struct selinux_policy { sidtab*, policydb, ... } */
 /* Heap allocations for the copy (KernelSU uses kmemdup/vmalloc the same way).
@@ -450,7 +448,7 @@ static void *g_backup_policy; /* our own struct selinux_policy-equivalent (heap)
 
 static bool selinux_sepolicy_supported(void)
 {
-    return kver >= KP_SEPOLICY_MIN_VERSION;
+    return selinux_hide_is_supported();
 }
 
 static struct policydb *kp_backup_policydb(void);
@@ -460,6 +458,81 @@ static int kp_context_to_sid_with_policy(const char *scontext, u32 scontext_len,
                                          gfp_t gfp);
 static int kp_sid_to_context_with_policy(u32 sid, char **scontext, u32 *scontext_len);
 static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);
+
+
+static struct {
+    void *task;
+    u32 depth;
+} clean_eval_scope = { NULL, 0 };
+
+/* Task-keyed and synchronous: only the task that entered the scope is
+ * redirected.  The slot is advisory — if another task holds it we just fall
+ * back to the live policy, so no atomicity is required. */
+static bool kp_clean_eval_enter(void)
+{
+    if (clean_eval_scope.task == current) {
+        clean_eval_scope.depth++;
+    } else if (!clean_eval_scope.task) {
+        clean_eval_scope.task = current;
+        clean_eval_scope.depth = 1;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static void kp_clean_eval_leave(void)
+{
+    if (clean_eval_scope.task == current) {
+        if (clean_eval_scope.depth > 1) {
+            clean_eval_scope.depth--;
+        } else {
+            clean_eval_scope.depth = 0;
+            clean_eval_scope.task = NULL;
+        }
+    }
+}
+
+static bool kp_clean_eval_active(void)
+{
+    return clean_eval_scope.task == current && clean_eval_scope.depth;
+}
+
+int selinux_sepolicy_clean_eval_enter(void)
+{
+    return kp_clean_eval_enter() ? 0 : -EAGAIN;
+}
+
+void selinux_sepolicy_clean_eval_leave(void)
+{
+    kp_clean_eval_leave();
+}
+
+static void before_context_struct_compute_av(hook_fargs6_t *a, void *u)
+{
+    if (!kp_clean_eval_active() || !g_backup_ready) return;
+    void *clean = kp_backup_policydb();
+    if (!is_bad_address(clean)) {
+        if (selinux_hide_query_log_level() >= 2)
+            logkfi("query redirect compute_av: policydb %llx -> %llx\n", a->arg0, (unsigned long)clean);
+        a->arg0 = (uint64_t)clean;
+    }
+}
+
+/* string_to_context_struct(policydb, sidtab, scontext, ctx, def_sid): same
+ * redirect so contextExists probes resolve against the clean snapshot. */
+static void before_string_to_context_struct(hook_fargs5_t *a, void *u)
+{
+    if (kp_clean_eval_active() && g_backup_ready) {
+        void *clean = kp_backup_policydb();
+        if (!is_bad_address(clean)) {
+            if (selinux_hide_query_log_level() >= 2)
+                logkfi("query redirect string_to_context_struct: policydb %llx -> %llx\n", a->arg0,
+                       (unsigned long)clean);
+            a->arg0 = (uint64_t)clean;
+        }
+    }
+}
 
 /* ---- KernelSU-style deep copy of the clean policy ----
  * Mirror of KernelSU's ksu_dup_sepolicy(): the copy is fully independent, so
@@ -628,7 +701,7 @@ static void kp_install_load_hook(void)
     if (g_load_hook_installed || !selinux_sepolicy_supported()) return;
     addr = lookup_name_with_suffix("security_load_policy");
     if (!addr) return;
-    if (kver >= KP_SEPOLICY_WITH_POLICY_MIN_VERSION)
+    if (selinux_hide_is_without_sepolicy_state_version())
         hook_wrap3((void *)addr, NULL, after_security_load_policy_3, NULL);
     else
         hook_wrap4((void *)addr, NULL, after_security_load_policy_4, NULL);
@@ -927,6 +1000,20 @@ int selinux_sepolicy_init(void)
     kp_context_struct_to_string = (context_struct_to_string_fn)lookup_name_with_suffix("context_struct_to_string");
     kp_sidtab_search_core = (sidtab_search_core_fn)lookup_name_with_suffix("sidtab_search_core");
     kp_context_struct_compute_av = (context_struct_compute_av_fn)lookup_name_with_suffix("context_struct_compute_av");
+    if (!selinux_hide_is_new_version()) {
+        /* Only the argument-redirect hooks are needed: the deep copy is consumed by
+        * swapping the policydb argument while an app query runs. */
+        addr = lookup_name_with_suffix("context_struct_compute_av");
+        if (addr) {
+            hook_wrap6((void *)addr, before_context_struct_compute_av, NULL, NULL);
+            log_boot("selinux_sepolicy: hooked context_struct_compute_av @ %llx\n", addr);
+        }
+        addr = lookup_name_with_suffix("string_to_context_struct");
+        if (addr) {
+            hook_wrap5((void *)addr, before_string_to_context_struct, NULL, NULL);
+            log_boot("selinux_sepolicy: hooked string_to_context_struct @ %llx\n", addr);
+        }
+    }
 
     /* Capture policy blobs as they are loaded, so the clean copy comes from the
      * full platform policy and not from an earlier (or later, patched) epoch.
@@ -934,7 +1021,7 @@ int selinux_sepolicy_init(void)
      * (state, data, len, load_state). */
     addr = lookup_name_with_suffix("security_load_policy");
     if (addr) {
-        if (kver >= KP_SEPOLICY_WITH_POLICY_MIN_VERSION)
+        if (selinux_hide_is_without_sepolicy_state_version())
             hook_wrap3((void *)addr, NULL, after_security_load_policy_3, NULL);
         else
             hook_wrap4((void *)addr, NULL, after_security_load_policy_4, NULL);
