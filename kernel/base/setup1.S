@@ -107,6 +107,14 @@ start_prepare:
     ldr x13, [x10, #setup_kconfig_size_offset]
     str x13, [x11, #start_kconfig_size_offset]
 
+    // start_preset.btf_offset = setup_preset.btf_offset
+    ldr x13, [x10, #setup_btf_offset_offset]
+    str x13, [x11, #start_btf_offset_offset]
+
+    // start_preset.btf_size = setup_preset.btf_size
+    ldr x13, [x10, #setup_btf_size_offset]
+    str x13, [x11, #start_btf_size_offset]
+
     // memcpy(&start_preset.setup, &setup_header, KP_HEADER_SIZE);
     add x0, x11, #start_header_offset
     add x1, x12, #0
@@ -263,8 +271,12 @@ map_prepare:
     // if ((map_data.paging_init_backup & 0xFFFFFD1F) == 0xD503211F)
     cmp w0, w1
     b.ne .backup
-    // map_data.paging_init_backup = NOP
-    mov w12, w3
+    // map_data.paging_init_backup = BTI c
+    // The PAC instruction was also paging_init's BTI landing pad, and _paging_init
+    // calls paging_init through a register. BTI c keeps a landing pad and is a
+    // hint, so it executes as NOP where BTI is not implemented or not enabled.
+    mov w12, #0x245F
+    movk w12, #0xD503, lsl#16
     // uint32_t *p = (uint32_t *)paging_init_pa + 1;
     add x11, x13, #4
 .cmp_auti:

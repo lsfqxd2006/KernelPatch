@@ -10,6 +10,7 @@
 #include <linux/sched/task.h>
 #include <linux/vmalloc.h>
 #include <baselib.h>
+#include <kbtf.h>
 #include <linux/pid.h>
 #include <asm/current.h>
 #include <linux/security.h>
@@ -176,6 +177,61 @@ static void add_bll(int16_t off, int16_t size)
     }
 }
 
+#define MTE_GRANULE 16
+
+static bool mte_tag_access_enabled(void)
+{
+    uint64_t pfr1, sctlr;
+    asm volatile("mrs %0, id_aa64pfr1_el1" : "=r"(pfr1));
+    if (((pfr1 >> 8) & 0xf) < 2) return false; // FEAT_MTE2: memory carries allocation tags
+    asm volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+    return sctlr & (1ull << 43); // SCTLR_EL1.ATA: EL1 may access allocation tags
+}
+
+// Allocation tag of the granule holding addr; only valid if mte_tag_access_enabled().
+static uint8_t mte_alloc_tag(uintptr_t addr)
+{
+    register uintptr_t x0 asm("x0") = addr;
+    asm volatile(".inst 0xd9600000" : "+r"(x0)); // ldg x0, [x0]
+    return (x0 >> 56) & 0xf;
+}
+
+/*
+ * suid, sgid and cap_ambient are found in the cred that setresuid, setresgid
+ * or prctl has just committed. It comes from cred_jar, so it is only
+ * sizeof(struct cred) long, unlike our CRED_MAX_SIZE scratch copies.
+ *
+ * Under hardware tag-based KASAN only the object's own granules carry the
+ * pointer tag; the rest of the slab slot is tagged invalid, and reading it is
+ * a tag-check fault, fatal with kasan.fault=panic. ksize() is not a safe bound
+ * there: it returns the slot size, and since Linux 6.2 it no longer retags the
+ * slot to make that size readable. Walk the allocation tags instead.
+ */
+static int live_cred_scan_len(const struct cred *cred)
+{
+    uintptr_t addr = (uintptr_t)cred;
+    int len = CRED_MAX_SIZE;
+
+    unsigned long (*slot_size)(const void *) = (typeof(slot_size))kallsyms_lookup_name("ksize");
+    if (slot_size) {
+        unsigned long size = slot_size(cred);
+        if (size && size < (unsigned long)len) len = (int)size;
+    }
+
+    // The match-all tag 0xff is never checked: KASAN_HW_TAGS is off.
+    if ((addr >> 56) == 0xff || !mte_tag_access_enabled()) return len;
+    // A pointer tag the memory does not carry is a KASAN_SW_TAGS tag, which
+    // only instrumented code checks.
+    uint8_t tag = (addr >> 56) & 0xf;
+    if (mte_alloc_tag(addr) != tag) return len;
+
+    int end = MTE_GRANULE;
+    while (end < len && mte_alloc_tag(addr + end) == tag)
+        end += MTE_GRANULE;
+    log_boot("    tagged cred: %x bytes\n", end);
+    return end;
+}
+
 int resolve_cred_offset()
 {
     log_boot("struct cred: \n");
@@ -318,7 +374,8 @@ int resolve_cred_offset()
     // suid
     raw_syscall3(__NR_setresuid, 0, 0, 1158);
     new_cred = *(struct cred **)((uintptr_t)task + task_struct_offset.cred_offset);
-    for (int i = 0; i < CRED_MAX_SIZE; i += sizeof(uint32_t)) {
+    int scan_len = live_cred_scan_len(new_cred);
+    for (int i = 0; i + (int)sizeof(uid_t) <= scan_len; i += sizeof(uint32_t)) {
         if (is_bl(i)) continue;
         uid_t *uidp = (uid_t *)((uintptr_t)new_cred + i);
         if (*uidp == 1158) {
@@ -333,7 +390,8 @@ int resolve_cred_offset()
     // sgid
     raw_syscall3(__NR_setresgid, 0, 0, 1158);
     new_cred = *(struct cred **)((uintptr_t)task + task_struct_offset.cred_offset);
-    for (int i = 0; i < CRED_MAX_SIZE; i += sizeof(uint32_t)) {
+    scan_len = live_cred_scan_len(new_cred);
+    for (int i = 0; i + (int)sizeof(gid_t) <= scan_len; i += sizeof(uint32_t)) {
         if (is_bl(i)) continue;
         gid_t *uidp = (gid_t *)((uintptr_t)new_cred + i);
         if (*uidp == 1158) {
@@ -353,11 +411,8 @@ int resolve_cred_offset()
     *(unsigned *)((uintptr_t)new_cred + cred_offset.securebits_offset) = 0;
     cap_task_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 0xf, 0, 0);
     new_cred = *(struct cred **)((uintptr_t)task + task_struct_offset.cred_offset);
-    /* prctl installed a slab cred, not one of our CRED_MAX_SIZE scratch buffers. */
-    unsigned long (*cred_size)(const void *) = (typeof(cred_size))kallsyms_lookup_name("ksize");
-    unsigned long ambient_scan_len = cred_size ? cred_size(new_cred) : CRED_MAX_SIZE;
-    for (int i = 0; i + (int)sizeof(kernel_cap_t) <= CRED_MAX_SIZE &&
-                    i + (int)sizeof(kernel_cap_t) <= ambient_scan_len; i += sizeof(uint32_t)) {
+    scan_len = live_cred_scan_len(new_cred);
+    for (int i = 0; i + (int)sizeof(kernel_cap_t) <= scan_len; i += sizeof(uint32_t)) {
         if (is_bl(i)) continue;
         kernel_cap_t cap = *(kernel_cap_t *)((uintptr_t)cred + i);
         kernel_cap_t new_cap = *(kernel_cap_t *)((uintptr_t)new_cred + i);
@@ -649,6 +704,42 @@ int resolve_mm_struct_offset()
     return 0;
 }
 
+static void btf_set(int16_t *dst, const char *s, const char *m)
+{
+    long o = kp_btf_member_offset(s, m);
+    if (o >= 0 && o <= 0x7fff) *dst = (int16_t)o;
+}
+
+// Override the offset tables with authoritative BTF values when the kernel
+// embeds BTF (GKI 5.10+). Runs after the heuristic resolvers, so it is a no-op
+// on kernels without BTF and never changes their behavior there.
+static void resolve_struct_btf(void)
+{
+    if (!kp_btf_available()) return;
+    log_boot("struct offsets: overriding with BTF\n");
+
+    btf_set(&task_struct_offset.pid_offset, "task_struct", "pid");
+    btf_set(&task_struct_offset.tgid_offset, "task_struct", "tgid");
+    btf_set(&task_struct_offset.real_cred_offset, "task_struct", "real_cred");
+    btf_set(&task_struct_offset.cred_offset, "task_struct", "cred");
+    btf_set(&task_struct_offset.comm_offset, "task_struct", "comm");
+    btf_set(&task_struct_offset.fs_offset, "task_struct", "fs");
+    btf_set(&task_struct_offset.files_offset, "task_struct", "files");
+    btf_set(&task_struct_offset.seccomp_offset, "task_struct", "seccomp");
+    btf_set(&task_struct_offset.security_offset, "task_struct", "security");
+    btf_set(&task_struct_offset.mm_offset, "task_struct", "mm");
+    btf_set(&task_struct_offset.active_mm_offset, "task_struct", "active_mm");
+
+    btf_set(&cred_offset.uid_offset, "cred", "uid");
+    btf_set(&cred_offset.gid_offset, "cred", "gid");
+    btf_set(&cred_offset.suid_offset, "cred", "suid");
+    btf_set(&cred_offset.sgid_offset, "cred", "sgid");
+    btf_set(&cred_offset.euid_offset, "cred", "euid");
+    btf_set(&cred_offset.egid_offset, "cred", "egid");
+
+    btf_set(&mm_struct_offset.pgd_offset, "mm_struct", "pgd");
+}
+
 int resolve_struct()
 {
     full_cap = CAP_FULL_SET;
@@ -662,6 +753,8 @@ int resolve_struct()
     if ((err = resolve_cred_offset())) goto out;
 
     resolve_mm_struct_offset();
+
+    resolve_struct_btf();
 
 out:
     return err;
